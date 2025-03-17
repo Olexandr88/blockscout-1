@@ -8,9 +8,11 @@ defmodule Indexer.Fetcher.OnDemand.ContractCode do
   use GenServer
   use Indexer.Fetcher, restart: :permanent
 
-  import EthereumJSONRPC, only: [fetch_codes: 2]
+  import EthereumJSONRPC, only: [fetch_codes: 2, integer_to_quantity: 1, json_rpc: 2]
 
+  alias EthereumJSONRPC.Nonce
   alias Explorer.Chain.Address
+  alias Explorer.Chain.Cache.BlockNumber
   alias Explorer.Chain.Events.Publisher
   alias Explorer.Counters.Helper
   alias Explorer.Utility.AddressContractCodeFetchAttempt
@@ -102,8 +104,20 @@ defmodule Indexer.Fetcher.OnDemand.ContractCode do
          true <- contract_code_object.code !== "0x" do
       case Address.set_contract_code(address_hash, contract_code_object.code) do
         {1, _} ->
-          AddressContractCodeFetchAttempt.delete(address_hash)
           Publisher.broadcast(%{fetched_bytecode: [address_hash, contract_code_object.code]}, :on_demand)
+
+          max_block_number = BlockNumber.get_max()
+
+          initial_block_ranges = %{
+            left: 0,
+            right: max_block_number
+          }
+
+          contract_creation_block_number = find_contract_creation_block_number(initial_block_ranges, address_hash)
+
+          # todo: send this block number to re-fetch
+
+          AddressContractCodeFetchAttempt.delete(address_hash)
 
         _ ->
           Logger.error(fn -> "Error while setting address #{inspect(to_string(address_hash))} deployed bytecode" end)
@@ -114,6 +128,53 @@ defmodule Indexer.Fetcher.OnDemand.ContractCode do
 
       _ ->
         AddressContractCodeFetchAttempt.insert_retries_number(address_hash)
+    end
+  end
+
+  defp find_contract_creation_block_number(block_ranges, address_hash) do
+    json_rpc_named_arguments = Application.get_env(:explorer, :json_rpc_named_arguments)
+    medium = trunc((block_ranges.right - block_ranges.left) / 2)
+    medium_position = block_ranges.left + medium
+
+    case %{id: 0, block_quantity: integer_to_quantity(medium_position), address: to_string(address_hash)}
+         |> Nonce.request()
+         |> json_rpc(json_rpc_named_arguments) do
+      {:ok, nonce_hex} ->
+        "0x" <> hexadecimal_digits = nonce_hex
+        nonce = String.to_integer(hexadecimal_digits, 16)
+
+        case nonce do
+          0 ->
+            left_new = new_left_position(medium, medium_position)
+            block_ranges = Map.put(block_ranges, :left, left_new)
+
+            shoud_continue_binary_search?(block_ranges, address_hash)
+
+          nonce when nonce > 0 ->
+            right_new = new_right_position(medium, medium_position)
+            block_ranges = Map.put(block_ranges, :right, right_new)
+
+            shoud_continue_binary_search?(block_ranges, address_hash)
+        end
+
+      _ ->
+        find_contract_creation_block_number(block_ranges, address_hash)
+    end
+  end
+
+  defp new_left_position(medium, medium_position) do
+    if medium == 0, do: medium_position + 1, else: medium_position
+  end
+
+  defp new_right_position(medium, medium_position) do
+    if medium == 0, do: medium_position - 1, else: medium_position
+  end
+
+  defp shoud_continue_binary_search?(block_ranges, address_hash) do
+    if block_ranges.left == block_ranges.right do
+      block_ranges.left
+    else
+      find_contract_creation_block_number(block_ranges, address_hash)
     end
   end
 
